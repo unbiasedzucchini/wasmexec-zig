@@ -35,16 +35,7 @@ pub fn build(b: *std.Build) void {
     wasm3.addIncludePath(b.path("wasm3"));
     wasm3.linkLibC();
 
-    // --- main executable ---
-    const exe = b.addExecutable(.{
-        .name = "wasmexec-zig",
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    exe.addIncludePath(b.path("wasm3"));
-    exe.linkLibrary(wasm3);
-    // Build sqlite3 from amalgamation source for full static linking
+    // --- sqlite3 from amalgamation ---
     const sqlite3_path = b.option([]const u8, "sqlite3-path", "Path to sqlite3 amalgamation") orelse "/opt/sqlite3";
     const sqlite3 = b.addStaticLibrary(.{
         .name = "sqlite3",
@@ -58,8 +49,22 @@ pub fn build(b: *std.Build) void {
     sqlite3.addIncludePath(.{ .cwd_relative = sqlite3_path });
     sqlite3.linkLibC();
 
+    // --- libmicrohttpd from source (no HTTPS) ---
+    const mhd_path = b.option([]const u8, "mhd-path", "Path to libmicrohttpd install prefix") orelse "/opt/libmicrohttpd";
+
+    // --- main executable ---
+    const exe = b.addExecutable(.{
+        .name = "wasmexec-zig",
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    exe.addIncludePath(b.path("wasm3"));
+    exe.linkLibrary(wasm3);
     exe.addIncludePath(.{ .cwd_relative = sqlite3_path });
     exe.linkLibrary(sqlite3);
+    exe.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{mhd_path}) });
+    exe.addObjectFile(.{ .cwd_relative = b.fmt("{s}/lib/libmicrohttpd.a", .{mhd_path}) });
     exe.linkLibC();
 
     b.installArtifact(exe);

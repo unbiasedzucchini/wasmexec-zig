@@ -3,10 +3,9 @@ const c = @cImport({
     @cInclude("sqlite3.h");
     @cInclude("wasm3.h");
     @cInclude("m3_env.h");
+    @cInclude("microhttpd.h");
 });
 const log = std.log.scoped(.server);
-const http = std.http;
-const net = std.net;
 const mem = std.mem;
 
 // ── Constants ────────────────────────────────────────────────────────
@@ -133,7 +132,6 @@ fn executeWasm(wasm_bytes: []const u8, input: []const u8) ![]const u8 {
         return error.WasmFindFunc;
     }
 
-    // Get memory and write input at WASM_INPUT_OFF
     var mem_size: u32 = 0;
     const mem_ptr = c.m3_GetMemory(runtime, &mem_size, 0);
     if (mem_ptr == null) return error.WasmNoMemory;
@@ -145,7 +143,6 @@ fn executeWasm(wasm_bytes: []const u8, input: []const u8) ![]const u8 {
     const wasm_mem: [*]u8 = @ptrCast(mem_ptr);
     @memcpy(wasm_mem[WASM_INPUT_OFF .. WASM_INPUT_OFF + input.len], input);
 
-    // Call run(input_ptr, input_len)
     const input_ptr_val: u32 = WASM_INPUT_OFF;
     const input_len_val: u32 = @intCast(input.len);
     const args = [_]?*const anyopaque{
@@ -158,7 +155,6 @@ fn executeWasm(wasm_bytes: []const u8, input: []const u8) ![]const u8 {
         return error.WasmCall;
     }
 
-    // Get return value (pointer to output)
     var ret_val: u32 = 0;
     var rets = [_]?*anyopaque{@ptrCast(&ret_val)};
     result = c.m3_GetResults(func, 1, @ptrCast(&rets));
@@ -167,7 +163,6 @@ fn executeWasm(wasm_bytes: []const u8, input: []const u8) ![]const u8 {
         return error.WasmGetResults;
     }
 
-    // Re-fetch memory (may have grown)
     var mem_size2: u32 = 0;
     const mem_ptr2 = c.m3_GetMemory(runtime, &mem_size2, 0);
     if (mem_ptr2 == null) return error.WasmNoMemory;
@@ -181,143 +176,202 @@ fn executeWasm(wasm_bytes: []const u8, input: []const u8) ![]const u8 {
 
     if (out_start + out_len > mem_size2) return error.WasmOutputOOB;
 
-    // Copy output
     const output = try alloc.alloc(u8, out_len);
     @memcpy(output, mem2[out_start .. out_start + out_len]);
     return output;
 }
 
-// ── HTTP Helpers ─────────────────────────────────────────────────────
+// ── Upload buffer (per-connection) ───────────────────────────────────
+
+const UploadBuf = struct {
+    data: ?[*]u8 = null,
+    len: usize = 0,
+    cap: usize = 0,
+
+    fn append(self: *UploadBuf, chunk: [*]const u8, size: usize) !void {
+        if (self.len + size > self.cap) {
+            var newcap: usize = if (self.cap == 0) 4096 else self.cap;
+            while (newcap < self.len + size) newcap *= 2;
+            if (newcap > MAX_BODY) return error.BodyTooLarge;
+            const new_data = alloc.alloc(u8, newcap) catch return error.OutOfMemory;
+            if (self.data) |old| {
+                @memcpy(new_data[0..self.len], old[0..self.len]);
+                alloc.free(old[0..self.cap]);
+            }
+            self.data = new_data.ptr;
+            self.cap = newcap;
+        }
+        @memcpy(self.data.?[self.len .. self.len + size], chunk[0..size]);
+        self.len += size;
+    }
+
+    fn slice(self: *const UploadBuf) []const u8 {
+        if (self.data) |d| return d[0..self.len];
+        return &[_]u8{};
+    }
+
+    fn deinit(self: *UploadBuf) void {
+        if (self.data) |d| {
+            alloc.free(d[0..self.cap]);
+        }
+        alloc.destroy(self);
+    }
+};
+
+// ── HTTP handler (libmicrohttpd) ─────────────────────────────────────
 
 const alloc = std.heap.c_allocator;
 
-fn readRequestBody(request: *http.Server.Request) ![]const u8 {
-    const reader = try request.reader();
-    return try reader.readAllAlloc(alloc, MAX_BODY);
-}
-
-// ── Route Handlers ───────────────────────────────────────────────────
-
 var store: BlobStore = undefined;
 
-fn handlePutBlob(request: *http.Server.Request) !void {
-    const body = try readRequestBody(request);
-    defer alloc.free(body);
-
-    const hex = store.put(body) catch {
-        try request.respond("Store error\n", .{ .status = .internal_server_error });
-        return;
-    };
-
-    var buf: [128]u8 = undefined;
-    const json = std.fmt.bufPrint(&buf, "{{\"hash\":\"{s}\"}}", .{hex}) catch unreachable;
-
-    try request.respond(json, .{ .status = .created });
+fn respondText(conn: *c.MHD_Connection, code: c_uint, text: [*]const u8, len: usize) c_uint {
+    const resp = c.MHD_create_response_from_buffer(
+        len,
+        @constCast(@ptrCast(text)),
+        c.MHD_RESPMEM_MUST_COPY,
+    ) orelse return c.MHD_NO;
+    _ = c.MHD_add_response_header(resp, "Content-Type", "text/plain");
+    const ret = c.MHD_queue_response(conn, code, resp);
+    c.MHD_destroy_response(resp);
+    return ret;
 }
 
-fn handleGetBlob(request: *http.Server.Request) !void {
-    const target = request.head.target;
-    const hash = target["/blobs/".len..];
-    if (hash.len != 64) {
-        try request.respond("Invalid hash\n", .{ .status = .bad_request });
-        return;
-    }
-
-    const data = store.get(hash) catch {
-        try request.respond("Store error\n", .{ .status = .internal_server_error });
-        return;
-    };
-
-    if (data) |d| {
-        defer alloc.free(d);
-        try request.respond(d, .{
-            .status = .ok,
-            .extra_headers = &.{
-                .{ .name = "content-type", .value = "application/octet-stream" },
-            },
-        });
-    } else {
-        try request.respond("Not Found\n", .{ .status = .not_found });
-    }
+fn respondOwned(conn: *c.MHD_Connection, code: c_uint, data: []const u8, content_type: [*:0]const u8) c_uint {
+    const resp = c.MHD_create_response_from_buffer(
+        data.len,
+        @constCast(@ptrCast(data.ptr)),
+        c.MHD_RESPMEM_MUST_COPY,
+    ) orelse return c.MHD_NO;
+    _ = c.MHD_add_response_header(resp, "Content-Type", content_type);
+    const ret = c.MHD_queue_response(conn, code, resp);
+    c.MHD_destroy_response(resp);
+    return ret;
 }
 
-fn handleExecute(request: *http.Server.Request) !void {
-    const target = request.head.target;
-    const hash = target["/execute/".len..];
-    if (hash.len != 64) {
-        try request.respond("Invalid hash\n", .{ .status = .bad_request });
-        return;
+fn handleRequest(
+    _: ?*anyopaque,
+    connection: ?*c.MHD_Connection,
+    url_c: [*c]const u8,
+    method_c: [*c]const u8,
+    _: [*c]const u8, // version
+    upload_data: [*c]const u8,
+    upload_data_size: [*c]usize,
+    con_cls: [*c]?*anyopaque,
+) callconv(.C) c_uint {
+    const conn = connection orelse return c.MHD_NO;
+    const url = mem.span(@as([*:0]const u8, @ptrCast(url_c)));
+    const method = mem.span(@as([*:0]const u8, @ptrCast(method_c)));
+    // First call: allocate upload buffer
+    if (con_cls.* == null) {
+        const ubuf = alloc.create(UploadBuf) catch return c.MHD_NO;
+        ubuf.* = .{};
+        con_cls.* = @ptrCast(ubuf);
+        return c.MHD_YES;
     }
 
-    const wasm_bytes = store.get(hash) catch {
-        try request.respond("Store error\n", .{ .status = .internal_server_error });
-        return;
-    };
+    const ubuf: *UploadBuf = @ptrCast(@alignCast(con_cls.*));
 
-    if (wasm_bytes == null) {
-        try request.respond("Not Found\n", .{ .status = .not_found });
-        return;
+    // Accumulate upload data
+    if (upload_data_size.* > 0) {
+        ubuf.append(upload_data, upload_data_size.*) catch
+            return respondText(conn, 500, "upload error\n", 14);
+        upload_data_size.* = 0;
+        return c.MHD_YES;
     }
-    defer alloc.free(wasm_bytes.?);
 
-    const input = try readRequestBody(request);
-    defer alloc.free(input);
+    // All data received — route
+    const body = ubuf.slice();
 
-    const output = executeWasm(wasm_bytes.?, input) catch |err| {
-        log.err("wasm exec failed: {}", .{err});
-        try request.respond("Execution error\n", .{ .status = .internal_server_error });
-        return;
-    };
-    defer alloc.free(output);
+    // PUT /blobs
+    if (mem.eql(u8, method, "PUT") and mem.eql(u8, url, "/blobs")) {
+        const hex = store.put(body) catch
+            return respondText(conn, 500, "store error\n", 13);
+        var json_buf: [128]u8 = undefined;
+        const json = std.fmt.bufPrint(&json_buf, "{{\"hash\":\"{s}\"}}", .{hex}) catch unreachable;
+        return respondOwned(conn, 201, json, "application/json");
+    }
 
-    try request.respond(output, .{ .status = .ok });
+    // GET /blobs/:hash
+    if (mem.eql(u8, method, "GET") and mem.startsWith(u8, url, "/blobs/")) {
+        const hash = url["/blobs/".len..];
+        if (hash.len != 64)
+            return respondText(conn, 400, "invalid hash\n", 14);
+
+        const data = store.get(hash) catch
+            return respondText(conn, 500, "store error\n", 13);
+
+        if (data) |d| {
+            defer alloc.free(d);
+            return respondOwned(conn, 200, d, "application/octet-stream");
+        } else {
+            return respondText(conn, 404, "not found\n", 10);
+        }
+    }
+
+    // POST /execute/:hash
+    if (mem.eql(u8, method, "POST") and mem.startsWith(u8, url, "/execute/")) {
+        const hash = url["/execute/".len..];
+        if (hash.len != 64)
+            return respondText(conn, 400, "invalid hash\n", 14);
+
+        const wasm_bytes = store.get(hash) catch
+            return respondText(conn, 500, "store error\n", 13);
+
+        if (wasm_bytes == null)
+            return respondText(conn, 404, "not found\n", 10);
+        defer alloc.free(wasm_bytes.?);
+
+        const output = executeWasm(wasm_bytes.?, body) catch |err| {
+            log.err("wasm exec failed: {}", .{err});
+            return respondText(conn, 500, "execution error\n", 17);
+        };
+        defer alloc.free(output);
+
+        return respondOwned(conn, 200, output, "application/octet-stream");
+    }
+
+    return respondText(conn, 404, "not found\n", 10);
 }
 
-fn handleRequest(request: *http.Server.Request) !void {
-    const target = request.head.target;
-    const method = request.head.method;
-
-    if (method == .PUT and mem.eql(u8, target, "/blobs")) {
-        return handlePutBlob(request);
+fn requestCompleted(
+    _: ?*anyopaque,
+    _: ?*c.MHD_Connection,
+    con_cls: [*c]?*anyopaque,
+    _: c.MHD_RequestTerminationCode,
+) callconv(.C) void {
+    if (con_cls.*) |ptr| {
+        const ubuf: *UploadBuf = @ptrCast(@alignCast(ptr));
+        ubuf.deinit();
+        con_cls.* = null;
     }
-
-    if (method == .GET and mem.startsWith(u8, target, "/blobs/")) {
-        return handleGetBlob(request);
-    }
-
-    if (method == .POST and mem.startsWith(u8, target, "/execute/")) {
-        return handleExecute(request);
-    }
-
-    try request.respond("Not Found\n", .{ .status = .not_found });
 }
 
 pub fn main() !void {
     store = try BlobStore.init("blobs.db");
     defer store.deinit();
 
-    const addr = net.Address.parseIp("0.0.0.0", PORT) catch unreachable;
-    var tcp_server = try addr.listen(.{ .reuse_address = true });
-    defer tcp_server.deinit();
+    const daemon = c.MHD_start_daemon(
+        c.MHD_USE_INTERNAL_POLLING_THREAD,
+        PORT,
+        null,
+        null,
+        handleRequest,
+        null,
+        @as(c_uint, c.MHD_OPTION_NOTIFY_COMPLETED),
+        requestCompleted,
+        @as(?*anyopaque, null),
+        @as(c_uint, c.MHD_OPTION_END),
+    ) orelse {
+        log.err("failed to start MHD daemon on port {d}", .{PORT});
+        return error.MhdStartFailed;
+    };
 
     log.info("listening on port {d}", .{PORT});
 
+    // Block forever (MHD runs in its own thread)
     while (true) {
-        const conn = try tcp_server.accept();
-        var buf: [8192]u8 = undefined;
-        var server = http.Server.init(conn, &buf);
-
-        while (server.state == .ready) {
-            var request = server.receiveHead() catch |err| {
-                if (err == error.HttpConnectionClosing) break;
-                log.err("receive head: {}", .{err});
-                break;
-            };
-
-            handleRequest(&request) catch |err| {
-                log.err("request handling failed: {}", .{err});
-                break;
-            };
-        }
+        std.time.sleep(std.time.ns_per_s);
     }
+
+    c.MHD_stop_daemon(daemon);
 }
