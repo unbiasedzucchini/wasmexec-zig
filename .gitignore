@@ -3,3 +3,4 @@ zig-out/
 blobs.db
 blobs.db-shm
 blobs.db-wal
+wasmexec-zig
