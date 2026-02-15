@@ -44,7 +44,22 @@ pub fn build(b: *std.Build) void {
     });
     exe.addIncludePath(b.path("wasm3"));
     exe.linkLibrary(wasm3);
-    exe.linkSystemLibrary("sqlite3");
+    // Build sqlite3 from amalgamation source for full static linking
+    const sqlite3_path = b.option([]const u8, "sqlite3-path", "Path to sqlite3 amalgamation") orelse "/opt/sqlite3";
+    const sqlite3 = b.addStaticLibrary(.{
+        .name = "sqlite3",
+        .target = target,
+        .optimize = optimize,
+    });
+    sqlite3.addCSourceFile(.{
+        .file = .{ .cwd_relative = b.fmt("{s}/sqlite3.c", .{sqlite3_path}) },
+        .flags = &.{ "-std=c11", "-O2", "-DSQLITE_THREADSAFE=1", "-DSQLITE_ENABLE_FTS5", "-DSQLITE_ENABLE_JSON1" },
+    });
+    sqlite3.addIncludePath(.{ .cwd_relative = sqlite3_path });
+    sqlite3.linkLibC();
+
+    exe.addIncludePath(.{ .cwd_relative = sqlite3_path });
+    exe.linkLibrary(sqlite3);
     exe.linkLibC();
 
     b.installArtifact(exe);
